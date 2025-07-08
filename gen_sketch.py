@@ -1,5 +1,6 @@
 import argparse
 import anthropic
+import openai
 import ast
 import cairosvg
 import json
@@ -19,7 +20,7 @@ def call_argparse():
     parser.add_argument('--concept_to_draw', type=str, default="cat")
     parser.add_argument('--seed_mode', type=str, default='deterministic', choices=['deterministic', 'stochastic'])
     parser.add_argument('--path2save', type=str, default=f"results/test")
-    parser.add_argument('--model', type=str, default='claude-3-5-sonnet-20240620')
+    parser.add_argument('--model', type=str, default='claude-3-5-sonnet-20240620', choices=['claude-3-5-sonnet-20240620', 'gpt-4o'])
     parser.add_argument('--gen_mode', type=str, default='generation', choices=['generation', 'completion'])
 
     # Grid params
@@ -54,57 +55,80 @@ class SketchApp:
         self.init_canvas_str = utils.image_to_str(self.init_canvas)
         self.cells_to_pixels_map = utils.cells_to_pixels(args.res, args.cell_size, header_size=args.cell_size)
 
-        # SVG related 
+        # SVG related
         self.stroke_width = args.stroke_width
-        
-        # LLM Setup (you need to provide your ANTHROPIC_API_KEY in your .env file)
+
+        # LLM Setup (you need to provide your API KEY in your .env file)
         self.cache = False
         self.max_tokens = 3000
         load_dotenv()
-        claude_key = os.getenv("ANTHROPIC_API_KEY")
-        self.client = anthropic.Anthropic(api_key=claude_key)
         self.model = args.model
+        if 'claude' in self.model:
+            claude_key = os.getenv("ANTHROPIC_API_KEY")
+            self.client = anthropic.Anthropic(api_key=claude_key)
+        elif 'gpt' in self.model:
+            openai_key = os.getenv("OPENAI_API_KEY")
+            self.client = openai.OpenAI(api_key=openai_key)
         self.input_prompt = sketch_first_prompt.format(concept=args.concept_to_draw, gt_sketches_str=gt_example)
         self.gen_mode = args.gen_mode
         self.seed_mode = args.seed_mode
-        
+
 
     def call_llm(self, system_message, other_msg, additional_args):
-        if self.cache:
-            init_response = self.client.beta.prompt_caching.messages.create(
-                    model=self.model,
-                    max_tokens=self.max_tokens,
-                    system=system_message,
-                    messages=other_msg,
-                    **additional_args
-                )
-        else:
-            init_response = self.client.messages.create(
-                    model=self.model,
-                    max_tokens=self.max_tokens,
-                    system=system_message,
-                    messages=other_msg,
-                    **additional_args
-                )
+        if 'claude' in self.model:
+            if self.cache:
+                init_response = self.client.beta.prompt_caching.messages.create(
+                        model=self.model,
+                        max_tokens=self.max_tokens,
+                        system=system_message,
+                        messages=other_msg,
+                        **additional_args
+                    )
+            else:
+                init_response = self.client.messages.create(
+                        model=self.model,
+                        max_tokens=self.max_tokens,
+                        system=system_message,
+                        messages=other_msg,
+                        **additional_args
+                    )
+        elif 'gpt' in self.model:
+            messages = [{"role": "system", "content": system_message}] + other_msg
+            # openai doesn't support top_k in the same way, and stop_sequences is just stop
+            openai_args = {}
+            if "temperature" in additional_args:
+                openai_args["temperature"] = additional_args["temperature"]
+            if "stop_sequences" in additional_args:
+                openai_args["stop"] = additional_args["stop_sequences"]
+
+            init_response = self.client.chat.completions.create(
+                model=self.model,
+                messages=messages,
+                max_tokens=self.max_tokens,
+                **openai_args
+            )
         return init_response
 
-    
+
     def define_input_to_llm(self, msg_history, init_canvas_str, msg):
         # other_msg should contain all messgae without the system prompt
-        other_msg = msg_history 
+        other_msg = msg_history
 
         content = []
         # Claude best practice is image-then-text
         if init_canvas_str is not None:
-            content.append({"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": init_canvas_str}}) 
+            if 'claude' in self.model:
+                content.append({"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": init_canvas_str}})
+            elif 'gpt' in self.model:
+                 content.append({"type": "image_url", "image_url": f"data:image/jpeg;base64,{init_canvas_str}"})
 
         content.append({"type": "text", "text": msg})
-        if self.cache:
+        if self.cache and 'claude' in self.model: # openai doesn't have prompt caching yet
             content[-1]["cache_control"] = {"type": "ephemeral"}
 
         other_msg = other_msg + [{"role": "user", "content": content}]
         return other_msg
-        
+
 
     def get_response_from_llm(
         self,
@@ -116,13 +140,14 @@ class SketchApp:
         seed_mode="stochastic",
         stop_sequences=None,
         gen_mode="generation"
-    ):  
+    ):
         additional_args = {}
         if seed_mode == "deterministic":
             additional_args["temperature"] = 0.0
-            additional_args["top_k"] = 1
+            if 'claude' in self.model:
+                additional_args["top_k"] = 1
 
-        if self.cache:
+        if self.cache and 'claude' in self.model:
             system_message = [{
                 "type": "text",
                 "text": system_message,
@@ -130,24 +155,27 @@ class SketchApp:
             }]
 
         # other_msg should contain all messgae without the system prompt
-        other_msg = self.define_input_to_llm(msg_history, init_canvas_str, msg) 
+        other_msg = self.define_input_to_llm(msg_history, init_canvas_str, msg)
 
         if gen_mode == "completion":
             if prefill_msg:
                 other_msg = other_msg + [{"role": "assistant", "content": f"{prefill_msg}"}]
-            
+
         # In case of stroke by stroke generation
         if stop_sequences:
             additional_args["stop_sequences"]= [stop_sequences]
         else:
             additional_args["stop_sequences"]= ["</answer>"]
- 
+
         response = self.call_llm(system_message, other_msg, additional_args)
-        content = response.content[0].text
-        
+        if 'claude' in self.model:
+            content = response.content[0].text
+        elif 'gpt' in self.model:
+            content = response.choices[0].message.content
+
         if gen_mode == "completion":
             other_msg = other_msg[:-1] # remove initial assistant prompt
-            content = f"{prefill_msg}{content}" 
+            content = f"{prefill_msg}{content}"
 
         # saves to json
         if self.path2save is not None:
@@ -162,7 +190,7 @@ class SketchApp:
                         }
                     ],
                 }
-            ]    
+            ]
             with open(f"{self.path2save}/experiment_log.json", 'w') as json_file:
                 json.dump(system_message_json + new_msg_history, json_file, indent=4)
             print(f"Data has been saved to [{self.path2save}/experiment_log.json]")
@@ -171,9 +199,9 @@ class SketchApp:
 
     def call_model_for_sketch_generation(self):
         print("Calling LLM...")
-        
+
         add_args = {}
-        add_args["stop_sequences"] = f"</answer>" 
+        add_args["stop_sequences"] = f"</answer>"
 
         msg_history = []
         init_canvas_str = None # self.init_canvas_str
@@ -190,7 +218,7 @@ class SketchApp:
 
         all_llm_output += f"</answer>"
         return all_llm_output
-        
+
 
     def parse_model_to_svg(self, model_rep_sketch):
         # Parse model_rep with xml
@@ -203,7 +231,7 @@ class SketchApp:
         # define SVG based on control point
         sketch_text_svg = utils.format_svg(all_control_points, dim=self.grid_size, stroke_width=self.stroke_width)
         return sketch_text_svg
-        
+
 
     def generate_sketch(self):
         sketching_commands = self.call_model_for_sketch_generation()
@@ -212,15 +240,15 @@ class SketchApp:
         with open(f"{self.path2save}/{self.target_concept}.svg", "w") as svg_file:
             svg_file.write(model_strokes_svg)
 
-        # vector->pixel 
+        # vector->pixel
         # save the sketch to png with blank backgournd
         cairosvg.svg2png(url=f"{self.path2save}/{self.target_concept}.svg", write_to=f"{self.path2save}/{self.target_concept}.png", background_color="white")
-        
+
         # save the sketch to png on the canvas
         output_png_path = f"{self.path2save}/{self.target_concept}_canvas.png"
         cairosvg.svg2png(url=f"{self.path2save}/{self.target_concept}.svg", write_to=output_png_path)
         foreground = Image.open(output_png_path)
-        self.init_canvas.paste(Image.open(output_png_path), (0, 0), foreground) 
+        self.init_canvas.paste(Image.open(output_png_path), (0, 0), foreground)
         self.init_canvas.save(output_png_path)
 
         
