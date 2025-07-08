@@ -52,6 +52,11 @@ Once you have the key, save it in the ```.env``` file:
 ANTHROPIC_API_KEY=<your_key>
 ```
 
+If you want to use the `gpt-4o` model, you will also need an OpenAI API key. You can get one from the [OpenAI website](https://beta.openai.com/signup/). Once you have the key, add it to your `.env` file:
+```
+OPENAI_API_KEY=<your_key>
+```
+
 # Start Sketching! :woman_artist: :art:
 ## Text-to-Sketch
 Generate a single sketch by running:
@@ -64,6 +69,7 @@ python gen_sketch.py --concept_to_draw "sailboat"
 ```
 
 Optional arguments:
+* ```--model``` Default is ```"claude-3-5-sonnet-20240620"```. Set to ```"gpt-4o"``` to use the OpenAI model.
 * ```--seed_mode``` Default is ```"deterministic"``` for reproducible results. Set to ```"stochastic"``` for increased variability.
 * ```--path2save``` By default, results are saved to ```results/test/```.
 
